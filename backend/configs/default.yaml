@@ -1,0 +1,33 @@
+app_name: opsbrain-backend
+env: dev
+app_version: 0.1.0
+log_level: info
+log_encoding: console
+log_development: true
+http_addr: ":8080"
+read_timeout: 15s
+write_timeout: 30s
+shutdown_timeout: 10s
+
+jwt_secret: please-change-me-in-production
+data_secret: please-change-data-secret
+access_token_ttl: 2h
+refresh_token_ttl: 168h
+
+bootstrap_admin_username: admin
+bootstrap_admin_email: admin@example.com
+bootstrap_admin_password: admin123456
+system_tenant_name: Default Tenant
+system_tenant_slug: default
+
+mysql_host: 36.138.61.152
+mysql_port: 30036
+mysql_user: root
+mysql_password: passw0rd
+mysql_database: opsbrain
+mysql_charset: utf8mb4
+mysql_parse_time: true
+mysql_max_open_conns: 10
+mysql_max_idle_conns: 5
+mysql_conn_max_lifetime: 1h
+mysql_auto_migrate: true
