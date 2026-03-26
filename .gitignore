@@ -32,6 +32,6 @@ go.work.sum
 # .vscode/
 
 /ref/
-./backend/configs
+./backend/configs/
 ./backend/.env*
 
