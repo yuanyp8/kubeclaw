@@ -56,6 +56,18 @@ func (r *UserRepository) List(ctx context.Context) ([]applicationuser.Profile, e
 	return r.buildProfiles(ctx, models)
 }
 
+func (r *UserRepository) ListByTenant(ctx context.Context, tenantID int64) ([]applicationuser.Profile, error) {
+	var models []mysqlinfra.UserModel
+	if err := r.db.WithContext(ctx).
+		Where("tenant_id = ?", tenantID).
+		Order("id asc").
+		Find(&models).Error; err != nil {
+		return nil, fmt.Errorf("list users by tenant: %w", err)
+	}
+
+	return r.buildProfiles(ctx, models)
+}
+
 func (r *UserRepository) Get(ctx context.Context, id int64) (*applicationuser.Profile, error) {
 	var model mysqlinfra.UserModel
 	if err := r.db.WithContext(ctx).First(&model, id).Error; err != nil {

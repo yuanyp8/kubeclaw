@@ -7,6 +7,7 @@ import (
 	applicationagent "kubeclaw/backend/internal/application/agent"
 	applicationaudit "kubeclaw/backend/internal/application/audit"
 	applicationauth "kubeclaw/backend/internal/application/auth"
+	applicationcapability "kubeclaw/backend/internal/application/capability"
 	applicationchat "kubeclaw/backend/internal/application/chat"
 	applicationcluster "kubeclaw/backend/internal/application/cluster"
 	applicationlogs "kubeclaw/backend/internal/application/logs"
@@ -82,6 +83,7 @@ func New(cfg config.Config) (*App, error) {
 	clusterService := applicationcluster.NewService(clusterRepo, k8sGateway)
 	mcpService := applicationmcp.NewService(mcpRepo)
 	skillService := appskill.NewService(skillRepo)
+	capabilityService := applicationcapability.NewService(skillService, mcpService).WithRuntime(modelService, clusterService, llmClient)
 	securityService := appsecurity.NewService(securityRepo)
 	chatService := applicationchat.NewService(chatRepo)
 	agentService := applicationagent.NewService(
@@ -89,6 +91,7 @@ func New(cfg config.Config) (*App, error) {
 		chatService,
 		modelService,
 		clusterService,
+		capabilityService,
 		skillService,
 		mcpService,
 		securityService,
@@ -100,22 +103,23 @@ func New(cfg config.Config) (*App, error) {
 	auditMiddleware := middleware.NewAuditMiddleware(auditService)
 
 	server, err := httpapi.NewServer(cfg, httpapi.Dependencies{
-		HealthHandler:   handlers.NewHealthHandler(cfg),
-		AuthHandler:     handlers.NewAuthHandler(authService),
-		UserHandler:     handlers.NewUserHandler(userService),
-		TenantHandler:   handlers.NewTenantHandler(tenantService),
-		TeamHandler:     handlers.NewTeamHandler(teamService),
-		AuditHandler:    handlers.NewAuditHandler(auditService),
-		LogHandler:      handlers.NewLogHandler(logService, auditService),
-		ModelHandler:    handlers.NewModelHandler(modelService),
-		ClusterHandler:  handlers.NewClusterHandler(clusterService, agentService),
-		MCPHandler:      handlers.NewMCPHandler(mcpService),
-		SkillHandler:    handlers.NewSkillHandler(skillService),
-		SecurityHandler: handlers.NewSecurityHandler(securityService),
-		AgentHandler:    handlers.NewAgentHandler(agentService, streams),
-		StubHandler:     handlers.NewStubHandler(),
-		AuthMiddleware:  authMiddleware,
-		AuditMiddleware: auditMiddleware,
+		HealthHandler:     handlers.NewHealthHandler(cfg),
+		AuthHandler:       handlers.NewAuthHandler(authService),
+		CapabilityHandler: handlers.NewCapabilityHandler(capabilityService, agentService),
+		UserHandler:       handlers.NewUserHandler(userService),
+		TenantHandler:     handlers.NewTenantHandler(tenantService),
+		TeamHandler:       handlers.NewTeamHandler(teamService),
+		AuditHandler:      handlers.NewAuditHandler(auditService),
+		LogHandler:        handlers.NewLogHandler(logService, auditService),
+		ModelHandler:      handlers.NewModelHandler(modelService),
+		ClusterHandler:    handlers.NewClusterHandler(clusterService, agentService),
+		MCPHandler:        handlers.NewMCPHandler(mcpService),
+		SkillHandler:      handlers.NewSkillHandler(skillService),
+		SecurityHandler:   handlers.NewSecurityHandler(securityService),
+		AgentHandler:      handlers.NewAgentHandler(agentService, streams),
+		StubHandler:       handlers.NewStubHandler(),
+		AuthMiddleware:    authMiddleware,
+		AuditMiddleware:   auditMiddleware,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("new http server: %w", err)

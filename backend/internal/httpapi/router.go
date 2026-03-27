@@ -31,7 +31,14 @@ func NewRouter(cfg config.Config, deps Dependencies) *gin.Engine {
 		protected.Use(deps.AuthMiddleware.RequireAuth())
 		{
 			registerProtectedAuthRoutes(protected.Group("/auth"), deps)
+			if deps.CapabilityHandler != nil {
+				protected.GET("/capabilities", deps.CapabilityHandler.List)
+				protected.GET("/capabilities/:ref", deps.CapabilityHandler.Get)
+				protected.POST("/capabilities/:ref/invoke", deps.CapabilityHandler.Invoke)
+				protected.POST("/capabilities/:ref/request", deps.CapabilityHandler.Request)
+			}
 			protected.GET("/users/me", deps.UserHandler.GetMe)
+			protected.GET("/users", deps.UserHandler.List)
 			protected.PUT("/users/me", deps.StubHandler.Handle("user", "update_profile"))
 
 			if deps.LogHandler != nil {
@@ -94,7 +101,6 @@ func registerProtectedAuthRoutes(group *gin.RouterGroup, deps Dependencies) {
 }
 
 func registerAdminUserRoutes(group *gin.RouterGroup, deps Dependencies) {
-	group.GET("/users", deps.UserHandler.List)
 	group.POST("/users", deps.UserHandler.Create)
 	group.GET("/users/:id", deps.UserHandler.Get)
 	group.PUT("/users/:id", deps.UserHandler.Update)

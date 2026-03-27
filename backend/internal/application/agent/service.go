@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	applicationcapability "kubeclaw/backend/internal/application/capability"
 	applicationchat "kubeclaw/backend/internal/application/chat"
 	applicationcluster "kubeclaw/backend/internal/application/cluster"
 	applicationmcp "kubeclaw/backend/internal/application/mcp"
@@ -184,6 +185,7 @@ type Service struct {
 	chat     ChatService
 	models   ModelService
 	clusters ClusterService
+	caps     *applicationcapability.Service
 	skills   SkillService
 	mcp      MCPService
 	security SecurityService
@@ -197,6 +199,7 @@ func NewService(
 	chat ChatService,
 	models ModelService,
 	clusters ClusterService,
+	capabilities *applicationcapability.Service,
 	skills SkillService,
 	mcp MCPService,
 	security SecurityService,
@@ -208,6 +211,7 @@ func NewService(
 		chat:     chat,
 		models:   models,
 		clusters: clusters,
+		caps:     capabilities,
 		skills:   skills,
 		mcp:      mcp,
 		security: security,
@@ -389,9 +393,12 @@ func (s *Service) executeRun(ctx context.Context, run Run, session applicationch
 
 	intent := s.analyzeIntent(ctx, session, userMessage.Content)
 	s.publishEvent(ctx, run.ID, run.SessionID, "planning", "orchestrator", StatusRunning, "execution plan created", map[string]any{
-		"intent": intent.Kind,
-		"tool":   intent.Tool,
-		"risk":   intent.RequiresApproval,
+		"intent":         intent.Kind,
+		"tool":           intent.Tool,
+		"risk":           intent.RequiresApproval,
+		"capabilityType": intent.CapabilityType,
+		"capabilityId":   intent.CapabilityID,
+		"capabilityName": intent.CapabilityName,
 	}, requestID)
 
 	if intent.RequiresApproval {
@@ -399,7 +406,7 @@ func (s *Service) executeRun(ctx context.Context, run Run, session applicationch
 			RunID:     run.ID,
 			SessionID: run.SessionID,
 			UserID:    run.UserID,
-			Type:      intent.Kind,
+			Type:      defaultString(intent.ApprovalType, intent.Kind),
 			Title:     intent.Title,
 			Reason:    intent.Reason,
 			Status:    "pending",
@@ -459,7 +466,14 @@ func (s *Service) executeApprovedAction(ctx context.Context, approval ApprovalRe
 		"type":       approval.Type,
 	}, requestID)
 
-	content, err := s.executeApprovedPayload(ctx, run, session, approval)
+	approvedIntent := approvalIntentFromPayload(approval.Payload)
+	userMessage := applicationchat.Message{
+		ID:        defaultInt64(run.UserMessageID),
+		SessionID: run.SessionID,
+		Role:      "user",
+		Content:   run.Input,
+	}
+	content, err := s.executeIntent(ctx, run, session, userMessage, approvedIntent, requestID)
 	if err != nil {
 		s.failRun(ctx, run, session, requestID, err)
 		return
@@ -487,12 +501,10 @@ func (s *Service) executeApprovedAction(ctx context.Context, approval ApprovalRe
 }
 
 func (s *Service) executeIntent(ctx context.Context, run Run, session applicationchat.Session, userMessage applicationchat.Message, intent intent, requestID string) (string, error) {
-	switch intent.Kind {
-	case "list_namespaces", "list_resources", "list_events", "list_models", "list_skills", "list_mcp":
-		return s.executeToolIntent(ctx, run, session, intent, requestID)
-	default:
+	if intent.Kind == "llm" || intent.CapabilityType == "llm" {
 		return s.executeLLMIntent(ctx, session, userMessage)
 	}
+	return s.executeCapabilityIntent(ctx, run, session, userMessage, intent, requestID)
 }
 
 func (s *Service) executeToolIntent(ctx context.Context, run Run, session applicationchat.Session, intent intent, requestID string) (string, error) {
@@ -503,10 +515,10 @@ func (s *Service) executeToolIntent(ctx context.Context, run Run, session applic
 	}
 
 	startedAt := time.Now()
-	s.publishEvent(ctx, run.ID, run.SessionID, "agent_spawn", s.agentRole(intent.Kind), StatusRunning, "specialist picked the task", map[string]any{
+	s.publishEvent(ctx, run.ID, run.SessionID, "agent_spawn", s.intentRole(intent), StatusRunning, "specialist picked the task", map[string]any{
 		"tool": intent.Tool,
 	}, requestID)
-	s.publishEvent(ctx, run.ID, run.SessionID, "tool_start", s.agentRole(intent.Kind), StatusRunning, "tool execution started", map[string]any{
+	s.publishEvent(ctx, run.ID, run.SessionID, "tool_start", s.intentRole(intent), StatusRunning, "tool execution started", map[string]any{
 		"toolExecutionId": toolExecutionID,
 		"tool":            intent.Tool,
 	}, requestID)
@@ -521,12 +533,12 @@ func (s *Service) executeToolIntent(ctx context.Context, run Run, session applic
 		return "", execErr
 	}
 
-	s.publishEvent(ctx, run.ID, run.SessionID, "tool_end", s.agentRole(intent.Kind), StatusCompleted, "tool execution completed", map[string]any{
+	s.publishEvent(ctx, run.ID, run.SessionID, "tool_end", s.intentRole(intent), StatusCompleted, "tool execution completed", map[string]any{
 		"toolExecutionId": toolExecutionID,
 		"tool":            intent.Tool,
 		"result":          result,
 	}, requestID)
-	s.publishEvent(ctx, run.ID, run.SessionID, "agent_result", s.agentRole(intent.Kind), StatusCompleted, "specialist returned a result", map[string]any{
+	s.publishEvent(ctx, run.ID, run.SessionID, "agent_result", s.intentRole(intent), StatusCompleted, "specialist returned a result", map[string]any{
 		"tool": intent.Tool,
 	}, requestID)
 
@@ -729,41 +741,26 @@ func (s *Service) failRun(ctx context.Context, run Run, session applicationchat.
 
 func (s *Service) userFacingRunError(ctx context.Context, session applicationchat.Session, err error) string {
 	if errors.Is(err, applicationmodel.ErrNotFound) {
-		return "当前会话没有可用模型，请先到模型管理里设置默认模型，或为会话绑定一个已测试通过的模型。"
+		return "No model is available for this session. Configure a default model or bind a model to the session first."
 	}
 	if strings.Contains(err.Error(), "Model not found") {
-		modelName := "当前模型"
+		modelName := "current model"
 		if resolvedModel, resolveErr := s.resolveSessionModel(ctx, session.Context.ModelID); resolveErr == nil {
 			modelName = fmt.Sprintf("%s (%s)", defaultString(resolvedModel.Name, resolvedModel.Model), resolvedModel.Model)
 		}
-		return fmt.Sprintf("%s 不可用，模型服务返回 “Model not found”。请到模型管理页测试并修正模型名称、Base URL 或默认模型配置。", modelName)
+		return fmt.Sprintf("%s is unavailable because the model service returned 'Model not found'. Check the model name, Base URL, and default model configuration.", modelName)
 	}
 	if strings.Contains(err.Error(), "returned reasoning only without a final answer") {
-		return "当前模型本次只返回了推理片段，没有生成最终答案。请适当提高模型的最大输出 Token，或换用更适合问答展示的模型。"
+		return "The model returned reasoning content only and did not produce a final answer. Increase the output limit or switch to a model that is better for direct answers."
 	}
 	if strings.Contains(err.Error(), "returned an empty answer") {
-		return "模型调用成功了，但没有返回可展示的答案。请先到模型管理页执行一次测试，确认模型模板和参数设置是否合适。"
+		return "The model call succeeded but returned an empty answer. Please verify the model configuration and run a connectivity test."
 	}
 	if strings.Contains(err.Error(), "llm endpoint returned") || strings.Contains(err.Error(), "request llm endpoint") {
-		return fmt.Sprintf("模型调用失败：%s。请到模型管理页执行一次连通性测试，确认模型名称和服务地址可用。", err.Error())
+		return fmt.Sprintf("Model request failed: %s. Check the model name, endpoint, and network connectivity.", err.Error())
 	}
-
-	switch {
-	case errors.Is(err, applicationmodel.ErrNotFound):
-		return "当前会话没有可用模型，请先到模型管理中设置默认模型，或为会话绑定一个已测试通过的模型。"
-	case strings.Contains(err.Error(), "Model not found"):
-		modelName := "当前模型"
-		if resolvedModel, resolveErr := s.resolveSessionModel(ctx, session.Context.ModelID); resolveErr == nil {
-			modelName = fmt.Sprintf("%s (%s)", defaultString(resolvedModel.Name, resolvedModel.Model), resolvedModel.Model)
-		}
-		return fmt.Sprintf("%s 不可用，模型服务返回“Model not found”。请到模型管理页测试并修正模型名称、Base URL 或默认模型配置。", modelName)
-	case strings.Contains(err.Error(), "llm endpoint returned"), strings.Contains(err.Error(), "request llm endpoint"):
-		return fmt.Sprintf("模型调用失败：%s。请到模型管理页执行一次连通性测试，确认模型名称和服务地址可用。", err.Error())
-	default:
-		return fmt.Sprintf("智能体执行失败：%s", err.Error())
-	}
+	return fmt.Sprintf("Agent execution failed: %s", err.Error())
 }
-
 func sanitizeLLMOutput(content string) (string, bool) {
 	trimmed := strings.TrimSpace(content)
 	if trimmed == "" {
@@ -783,13 +780,9 @@ func sanitizeLLMOutput(content string) (string, bool) {
 }
 
 func orchestratorSystemPrompt(userInput string) string {
-	if regexp.MustCompile(`[\p{Han}]`).MatchString(userInput) {
-		return "你是 KubeClaw 智能体编排器。请始终使用中文直接给出最终答案，内容要务实、简洁，并结合当前平台上下文。不要输出隐藏推理过程、不要输出 <think> 标签内容；如果你是推理模型，只返回最终答案。"
-	}
-
+	_ = userInput
 	return "You are the KubeClaw orchestrator. Answer in the same language as the user, keep answers practical and concise, and do not expose hidden chain-of-thought or <think> content. If you are a reasoning model, return only the final answer."
 }
-
 func (s *Service) publishEvent(ctx context.Context, runID int64, sessionID int64, eventType string, role string, status string, message string, payload map[string]any, requestID ...string) {
 	reqID := ""
 	if len(requestID) > 0 {
@@ -820,7 +813,12 @@ func (s *Service) publishEvent(ctx context.Context, runID int64, sessionID int64
 type intent struct {
 	Kind             string
 	Tool             string
+	CapabilityType   string
+	CapabilityID     int64
+	CapabilityName   string
+	CapabilityRole   string
 	RequiresApproval bool
+	ApprovalType     string
 	Title            string
 	Reason           string
 	Payload          map[string]any
@@ -830,36 +828,59 @@ func (s *Service) analyzeIntent(ctx context.Context, session applicationchat.Ses
 	raw := strings.TrimSpace(content)
 	text := strings.ToLower(raw)
 
-	if planned, ok := s.planIntentWithModel(ctx, session, raw); ok {
-		if risky, title, reason, payload := s.detectSensitiveReview(text); risky {
-			return intent{
-				Kind:             title,
-				Tool:             title,
-				RequiresApproval: true,
-				Title:            strings.ReplaceAll(title, "_", " "),
-				Reason:           reason,
-				Payload:          payload,
-			}
-		}
-		return planned
-	}
-
-	risky, title, reason, payload := s.detectRiskyIntent(raw, text)
-	if risky {
-		return intent{
-			Kind:             title,
-			Tool:             title,
-			RequiresApproval: true,
-			Title:            strings.ReplaceAll(title, "_", " "),
-			Reason:           reason,
-			Payload:          payload,
+	capabilities := s.loadCapabilities(ctx)
+	selected, ok := s.planIntentWithModel(ctx, session, raw, capabilities)
+	if !ok {
+		if focused, matched := s.resourceFocusedHeuristic(raw, text); matched {
+			selected = focused
+		} else {
+			selected = s.heuristicIntent(raw, text)
 		}
 	}
+	selected = s.resolveIntentCapability(raw, selected, capabilities)
 
-	return s.heuristicIntent(raw, text)
+	if risky, approvalType, reason, extraPayload := s.detectSensitiveReview(ctx, text); risky {
+		selected.RequiresApproval = true
+		selected.ApprovalType = approvalType
+		selected.Title = strings.ReplaceAll(approvalType, "_", " ")
+		selected.Reason = reason
+		selected.Payload = mergePayloads(buildApprovalIntentPayload(selected), extraPayload)
+		return selected
+	}
+
+	if risky, approvalType, reason, payload := s.detectRiskyIntent(raw, text); risky {
+		selected.RequiresApproval = true
+		selected.ApprovalType = approvalType
+		selected.Title = plannedTitle(approvalType)
+		selected.Reason = reason
+		selected.Payload = mergePayloads(buildApprovalIntentPayload(selected), payload)
+		return selected
+	}
+
+	return selected
 }
 
-func (s *Service) planIntentWithModel(ctx context.Context, session applicationchat.Session, raw string) (intent, bool) {
+func (s *Service) detectExplicitCapabilityExecutionIntent(ctx context.Context, raw string, text string) (intent, bool) {
+	_ = ctx
+	_ = raw
+	_ = text
+	return intent{}, false
+}
+
+func containsExecutionVerb(text string) bool {
+	return strings.Contains(text, "use ") ||
+		strings.Contains(text, "using ") ||
+		strings.Contains(text, "call ") ||
+		strings.Contains(text, "invoke ") ||
+		strings.Contains(text, "trigger ") ||
+		strings.Contains(text, "run ")
+}
+func (s *Service) explainCapabilityExecutionUnavailable(ctx context.Context, selected intent) (string, error) {
+	_ = ctx
+	_ = selected
+	return "Capability execution is now routed through the unified agent executor.", nil
+}
+func (s *Service) planIntentWithModel(ctx context.Context, session applicationchat.Session, raw string, capabilities []capability) (intent, bool) {
 	resolvedModel, err := s.resolveSessionModel(ctx, session.Context.ModelID)
 	if err != nil {
 		return intent{}, false
@@ -871,6 +892,7 @@ func (s *Service) planIntentWithModel(ctx context.Context, session applicationch
 		"modelId":   session.Context.ModelID,
 	}
 	contextJSON, _ := json.Marshal(contextData)
+	capabilitiesJSON, _ := json.Marshal(s.plannerCapabilityCatalog(capabilities))
 
 	result, err := s.llm.Chat(ctx, llm.ChatInput{
 		Model: *resolvedModel,
@@ -879,12 +901,12 @@ func (s *Service) planIntentWithModel(ctx context.Context, session applicationch
 				Role: "system",
 				Content: "You are the KubeClaw planner. Return one JSON object only. " +
 					"Schema: {\"kind\":\"list_namespaces|list_resources|list_events|list_models|list_skills|list_mcp|delete_resource|scale_deployment|restart_deployment|apply_yaml|llm\"," +
-					"\"tool\":\"string\",\"resourceType\":\"string\",\"resourceName\":\"string\",\"namespace\":\"string\",\"replicas\":0,\"requiresApproval\":false,\"reason\":\"string\"}. " +
-					"Choose tool actions only when the user explicitly asks for an operation. Use llm for normal conversation.",
+					"\"capabilityType\":\"builtin|skill|mcp|llm\",\"capabilityId\":0,\"capabilityName\":\"string\",\"tool\":\"string\",\"resourceType\":\"string\",\"resourceName\":\"string\",\"namespace\":\"string\",\"replicas\":0,\"reason\":\"string\"}. " +
+					"Prefer an explicitly named skill or MCP when it matches. Prefer skills over MCP when both fit. Fall back to builtin tools when no external capability clearly matches. Use llm for normal conversation.",
 			},
 			{
 				Role:    "user",
-				Content: fmt.Sprintf("session_context=%s\nuser_message=%s", string(contextJSON), raw),
+				Content: fmt.Sprintf("session_context=%s\ncapabilities=%s\nuser_message=%s", string(contextJSON), string(capabilitiesJSON), raw),
 			},
 		},
 	})
@@ -893,24 +915,28 @@ func (s *Service) planIntentWithModel(ctx context.Context, session applicationch
 	}
 
 	var plan struct {
-		Kind             string `json:"kind"`
-		Tool             string `json:"tool"`
-		ResourceType     string `json:"resourceType"`
-		ResourceName     string `json:"resourceName"`
-		Namespace        string `json:"namespace"`
-		Replicas         int    `json:"replicas"`
-		RequiresApproval bool   `json:"requiresApproval"`
-		Reason           string `json:"reason"`
+		Kind           string `json:"kind"`
+		CapabilityType string `json:"capabilityType"`
+		CapabilityID   int64  `json:"capabilityId"`
+		CapabilityName string `json:"capabilityName"`
+		Tool           string `json:"tool"`
+		ResourceType   string `json:"resourceType"`
+		ResourceName   string `json:"resourceName"`
+		Namespace      string `json:"namespace"`
+		Replicas       int    `json:"replicas"`
+		Reason         string `json:"reason"`
 	}
 	if err := json.Unmarshal([]byte(extractJSONObject(result.Content)), &plan); err != nil {
 		return intent{}, false
 	}
 
 	mapped := intent{
-		Kind:             normalizePlannedKind(plan.Kind),
-		Tool:             plan.Tool,
-		RequiresApproval: plan.RequiresApproval,
-		Reason:           strings.TrimSpace(plan.Reason),
+		Kind:           normalizePlannedKind(plan.Kind),
+		Tool:           strings.TrimSpace(plan.Tool),
+		CapabilityType: strings.ToLower(strings.TrimSpace(plan.CapabilityType)),
+		CapabilityID:   plan.CapabilityID,
+		CapabilityName: strings.TrimSpace(plan.CapabilityName),
+		Reason:         strings.TrimSpace(plan.Reason),
 		Payload: map[string]any{
 			"type":      normalizeResourceType(plan.ResourceType),
 			"name":      strings.TrimSpace(plan.ResourceName),
@@ -923,12 +949,6 @@ func (s *Service) planIntentWithModel(ctx context.Context, session applicationch
 	}
 
 	switch mapped.Kind {
-	case "delete_resource", "scale_deployment", "restart_deployment", "apply_yaml":
-		mapped.RequiresApproval = true
-		mapped.Title = plannedTitle(mapped.Kind)
-		if mapped.Reason == "" {
-			mapped.Reason = plannedReason(mapped.Kind)
-		}
 	case "list_resources":
 		if stringField(mapped.Payload["type"]) == "" {
 			mapped.Payload["type"] = inferResourceType(raw)
@@ -944,42 +964,87 @@ func (s *Service) planIntentWithModel(ctx context.Context, session applicationch
 	return mapped, true
 }
 
+func (s *Service) plannerCapabilityCatalog(capabilities []capability) []map[string]any {
+	items := make([]map[string]any, 0, len(capabilities))
+	for _, item := range capabilities {
+		items = append(items, map[string]any{
+			"type":             item.CapabilityType,
+			"id":               item.ID,
+			"name":             item.Name,
+			"tool":             item.Tool,
+			"summary":          item.Summary,
+			"actions":          item.Actions,
+			"resourceTypes":    item.ResourceTypes,
+			"level":            item.Level,
+			"audiences":        item.Audiences,
+			"mutation":         item.Mutation,
+			"requiresApproval": item.RequiresApproval,
+			"requestMode":      item.RequestMode,
+		})
+	}
+	return items
+}
+
+func (s *Service) resourceFocusedHeuristic(raw string, text string) (intent, bool) {
+	switch {
+	case strings.Contains(text, "pod"), strings.Contains(text, "pods"):
+		return intent{Kind: "list_resources", Tool: "cluster.list_resources", CapabilityType: "builtin", Payload: map[string]any{
+			"type":      "pods",
+			"namespace": inferNamespace(raw),
+		}}, true
+	case strings.Contains(text, "deployment"), strings.Contains(text, "deployments"):
+		return intent{Kind: "list_resources", Tool: "cluster.list_resources", CapabilityType: "builtin", Payload: map[string]any{
+			"type":      "deployments",
+			"namespace": inferNamespace(raw),
+		}}, true
+	case strings.Contains(text, "service"):
+		return intent{Kind: "list_resources", Tool: "cluster.list_resources", CapabilityType: "builtin", Payload: map[string]any{
+			"type":      "services",
+			"namespace": inferNamespace(raw),
+		}}, true
+	case strings.Contains(text, "event"):
+		return intent{Kind: "list_events", Tool: "cluster.list_events", CapabilityType: "builtin", Payload: map[string]any{
+			"namespace": inferNamespace(raw),
+		}}, true
+	default:
+		return intent{}, false
+	}
+}
 func (s *Service) heuristicIntent(raw string, text string) intent {
 	switch {
-	case strings.Contains(text, "namespace"), strings.Contains(text, "命名空间"):
-		return intent{Kind: "list_namespaces", Tool: "cluster.list_namespaces", Payload: map[string]any{}}
-	case strings.Contains(text, "event"), strings.Contains(text, "事件"):
-		return intent{Kind: "list_events", Tool: "cluster.list_events", Payload: map[string]any{
-			"namespace": inferNamespace(raw),
-		}}
-	case strings.Contains(text, "pod"), strings.Contains(text, "pods"), strings.Contains(text, "容器组"):
-		return intent{Kind: "list_resources", Tool: "cluster.list_resources", Payload: map[string]any{
+	case strings.Contains(text, "pod"), strings.Contains(text, "pods"):
+		return intent{Kind: "list_resources", Tool: "cluster.list_resources", CapabilityType: "builtin", Payload: map[string]any{
 			"type":      "pods",
 			"namespace": inferNamespace(raw),
 		}}
-	case strings.Contains(text, "deployment"), strings.Contains(text, "deployments"), strings.Contains(text, "部署"):
-		return intent{Kind: "list_resources", Tool: "cluster.list_resources", Payload: map[string]any{
+	case strings.Contains(text, "deployment"), strings.Contains(text, "deployments"):
+		return intent{Kind: "list_resources", Tool: "cluster.list_resources", CapabilityType: "builtin", Payload: map[string]any{
 			"type":      "deployments",
 			"namespace": inferNamespace(raw),
 		}}
-	case strings.Contains(text, "service"), strings.Contains(text, "服务"):
-		return intent{Kind: "list_resources", Tool: "cluster.list_resources", Payload: map[string]any{
+	case strings.Contains(text, "service"):
+		return intent{Kind: "list_resources", Tool: "cluster.list_resources", CapabilityType: "builtin", Payload: map[string]any{
 			"type":      "services",
 			"namespace": inferNamespace(raw),
 		}}
-	case strings.Contains(text, "model"), strings.Contains(text, "模型"):
-		return intent{Kind: "list_models", Tool: "model.list", Payload: map[string]any{}}
-	case strings.Contains(text, "skill"), strings.Contains(text, "技能"):
-		return intent{Kind: "list_skills", Tool: "skill.list", Payload: map[string]any{}}
+	case strings.Contains(text, "event"):
+		return intent{Kind: "list_events", Tool: "cluster.list_events", CapabilityType: "builtin", Payload: map[string]any{
+			"namespace": inferNamespace(raw),
+		}}
+	case strings.Contains(text, "namespace"):
+		return intent{Kind: "list_namespaces", Tool: "cluster.list_namespaces", CapabilityType: "builtin", Payload: map[string]any{}}
+	case strings.Contains(text, "model"):
+		return intent{Kind: "list_models", Tool: "model.list", CapabilityType: "builtin", Payload: map[string]any{}}
+	case strings.Contains(text, "skill"):
+		return intent{Kind: "list_skills", Tool: "skill.list", CapabilityType: "builtin", Payload: map[string]any{}}
 	case strings.Contains(text, "mcp"):
-		return intent{Kind: "list_mcp", Tool: "mcp.list", Payload: map[string]any{}}
+		return intent{Kind: "list_mcp", Tool: "mcp.list", CapabilityType: "builtin", Payload: map[string]any{}}
 	default:
-		return intent{Kind: "llm", Tool: "llm.chat", Payload: map[string]any{}}
+		return intent{Kind: "llm", Tool: "llm.chat", CapabilityType: "llm", Payload: map[string]any{}}
 	}
 }
-
-func (s *Service) detectSensitiveReview(text string) (bool, string, string, map[string]any) {
-	words, err := s.security.ListSensitiveWords(context.Background())
+func (s *Service) detectSensitiveReview(ctx context.Context, text string) (bool, string, string, map[string]any) {
+	words, err := s.security.ListSensitiveWords(ctx)
 	if err == nil {
 		for _, item := range words {
 			if item.IsEnabled && strings.Contains(text, strings.ToLower(item.Word)) {
@@ -992,20 +1057,16 @@ func (s *Service) detectSensitiveReview(text string) (bool, string, string, map[
 }
 
 func (s *Service) detectRiskyIntent(raw string, text string) (bool, string, string, map[string]any) {
-	if risky, title, reason, payload := s.detectSensitiveReview(text); risky {
-		return risky, title, reason, payload
-	}
-
 	switch {
-	case strings.Contains(text, "delete "), strings.Contains(text, "删除"):
+	case strings.Contains(text, "delete "):
 		return true, "delete_resource", "Deleting Kubernetes resources requires human approval.", parseResourceCommand(raw)
-	case strings.Contains(text, "scale "), strings.Contains(text, "扩容"), strings.Contains(text, "缩容"), strings.Contains(text, "副本"):
+	case strings.Contains(text, "scale "), strings.Contains(text, "replica"):
 		payload := parseScaleCommand(raw)
 		return true, "scale_deployment", "Scaling a workload changes runtime state and requires approval.", payload
-	case strings.Contains(text, "restart "), strings.Contains(text, "重启"):
+	case strings.Contains(text, "restart "):
 		payload := parseRestartCommand(raw)
 		return true, "restart_deployment", "Restarting a workload affects live traffic and requires approval.", payload
-	case strings.Contains(text, "apply ") || strings.Contains(text, "kubectl apply") || strings.Contains(text, "应用yaml") || strings.Contains(text, "应用 yaml"):
+	case strings.Contains(text, "apply ") || strings.Contains(text, "kubectl apply") || strings.Contains(text, "apply yaml"):
 		return true, "apply_yaml", "Applying manifests can mutate cluster state and requires approval.", map[string]any{
 			"manifest": raw,
 		}
@@ -1013,13 +1074,24 @@ func (s *Service) detectRiskyIntent(raw string, text string) (bool, string, stri
 		return false, "", "", nil
 	}
 }
-
-func (s *Service) agentRole(kind string) string {
-	switch kind {
-	case "list_namespaces", "list_resources", "list_events":
-		return "k8s_expert"
-	case "list_skills", "list_mcp":
-		return "skill_mcp_expert"
+func (s *Service) intentRole(selected intent) string {
+	if strings.TrimSpace(selected.CapabilityRole) != "" {
+		return selected.CapabilityRole
+	}
+	switch selected.CapabilityType {
+	case "skill":
+		return "skill_worker"
+	case "mcp":
+		return "mcp_worker"
+	case "builtin":
+		switch selected.Kind {
+		case "list_namespaces", "list_resources", "list_events", "delete_resource", "scale_deployment", "restart_deployment", "apply_yaml":
+			return "k8s_expert"
+		case "list_skills", "list_mcp", "list_models":
+			return "skill_mcp_expert"
+		default:
+			return "orchestrator"
+		}
 	default:
 		return "orchestrator"
 	}
@@ -1069,22 +1141,22 @@ func parseResourceCommand(text string) map[string]any {
 	parts := strings.Fields(text)
 	for idx, item := range parts {
 		switch item {
-		case "pod", "pods", "容器组":
+		case "pod", "pods":
 			payload["type"] = "pods"
 			if idx+1 < len(parts) {
 				payload["name"] = parts[idx+1]
 			}
-		case "deployment", "deployments", "部署":
+		case "deployment", "deployments":
 			payload["type"] = "deployments"
 			if idx+1 < len(parts) {
 				payload["name"] = parts[idx+1]
 			}
-		case "service", "services", "服务":
+		case "service", "services":
 			payload["type"] = "services"
 			if idx+1 < len(parts) {
 				payload["name"] = parts[idx+1]
 			}
-		case "namespace", "命名空间":
+		case "namespace":
 			if idx+1 < len(parts) {
 				payload["namespace"] = parts[idx+1]
 			}
@@ -1102,15 +1174,15 @@ func parseScaleCommand(text string) map[string]any {
 	parts := strings.Fields(text)
 	for idx, item := range parts {
 		switch item {
-		case "deployment", "deployments", "scale", "部署", "扩容", "缩容":
+		case "deployment", "deployments", "scale":
 			if idx+1 < len(parts) {
 				payload["name"] = parts[idx+1]
 			}
-		case "namespace", "命名空间":
+		case "namespace":
 			if idx+1 < len(parts) {
 				payload["namespace"] = parts[idx+1]
 			}
-		case "to", "到", "副本":
+		case "to", "replicas":
 			if idx+1 < len(parts) {
 				var replicas int
 				fmt.Sscanf(parts[idx+1], "%d", &replicas)
@@ -1131,11 +1203,11 @@ func parseRestartCommand(text string) map[string]any {
 	parts := strings.Fields(text)
 	for idx, item := range parts {
 		switch item {
-		case "deployment", "deployments", "restart", "部署", "重启":
+		case "deployment", "deployments", "restart":
 			if idx+1 < len(parts) {
 				payload["name"] = parts[idx+1]
 			}
-		case "namespace", "命名空间":
+		case "namespace":
 			if idx+1 < len(parts) {
 				payload["namespace"] = parts[idx+1]
 			}
@@ -1146,9 +1218,9 @@ func parseRestartCommand(text string) map[string]any {
 
 func extractJSONObject(content string) string {
 	trimmed := strings.TrimSpace(content)
-	trimmed = strings.TrimPrefix(trimmed, "```json")
-	trimmed = strings.TrimPrefix(trimmed, "```")
-	trimmed = strings.TrimSuffix(trimmed, "```")
+	trimmed = strings.TrimPrefix(trimmed, "`json")
+	trimmed = strings.TrimPrefix(trimmed, "`")
+	trimmed = strings.TrimSuffix(trimmed, "`")
 	trimmed = strings.TrimSpace(trimmed)
 
 	start := strings.Index(trimmed, "{")
@@ -1188,11 +1260,11 @@ func normalizePlannedKind(kind string) string {
 
 func normalizeResourceType(resourceType string) string {
 	switch strings.ToLower(strings.TrimSpace(resourceType)) {
-	case "pod", "pods", "容器组":
+	case "pod", "pods":
 		return "pods"
-	case "deployment", "deployments", "部署":
+	case "deployment", "deployments":
 		return "deployments"
-	case "service", "services", "服务":
+	case "service", "services":
 		return "services"
 	case "configmap", "configmaps":
 		return "configmaps"
@@ -1206,9 +1278,9 @@ func normalizeResourceType(resourceType string) string {
 func inferResourceType(text string) string {
 	lower := strings.ToLower(text)
 	switch {
-	case strings.Contains(lower, "pod"), strings.Contains(text, "容器组"):
+	case strings.Contains(lower, "pod"):
 		return "pods"
-	case strings.Contains(lower, "service"), strings.Contains(text, "服务"):
+	case strings.Contains(lower, "service"):
 		return "services"
 	case strings.Contains(lower, "configmap"):
 		return "configmaps"
@@ -1220,10 +1292,7 @@ func inferResourceType(text string) string {
 }
 
 func inferNamespace(text string) string {
-	if value := captureMatch(`namespace\s+([a-zA-Z0-9\-_.]+)`, text); value != "" {
-		return value
-	}
-	if value := captureMatch(`命名空间[:：]?\s*([a-zA-Z0-9\-_.]+)`, text); value != "" {
+	if value := captureMatch("namespace\\s+([a-zA-Z0-9\\-_.]+)", text); value != "" {
 		return value
 	}
 	return ""
@@ -1301,17 +1370,17 @@ func buildActionSessionTitle(input ClusterActionRequestInput) string {
 
 func buildClusterActionMessage(input ClusterActionRequestInput) string {
 	namespace := defaultString(input.Namespace, "default")
-	switch input.Action {
+	switch strings.ToLower(strings.TrimSpace(input.Action)) {
 	case "delete_resource":
-		return fmt.Sprintf("delete %s %s namespace %s", defaultString(input.ResourceType, "deployments"), input.ResourceName, namespace)
+		return fmt.Sprintf("Delete %s %s in namespace %s.", input.ResourceType, input.ResourceName, namespace)
 	case "scale_deployment":
-		return fmt.Sprintf("scale deployment %s namespace %s to %d", input.ResourceName, namespace, input.Replicas)
+		return fmt.Sprintf("Scale deployment %s in namespace %s to %d replicas.", input.ResourceName, namespace, input.Replicas)
 	case "restart_deployment":
-		return fmt.Sprintf("restart deployment %s namespace %s", input.ResourceName, namespace)
+		return fmt.Sprintf("Restart deployment %s in namespace %s.", input.ResourceName, namespace)
 	case "apply_yaml":
-		return fmt.Sprintf("apply yaml\n%s", input.Manifest)
+		return input.Manifest
 	default:
-		return input.Action
+		return defaultString(input.Action, "cluster action request")
 	}
 }
 
@@ -1320,4 +1389,11 @@ func defaultString(value string, fallback string) string {
 		return fallback
 	}
 	return strings.TrimSpace(value)
+}
+
+func defaultInt64(value *int64) int64 {
+	if value == nil {
+		return 0
+	}
+	return *value
 }

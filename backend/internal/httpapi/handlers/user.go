@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	applicationuser "kubeclaw/backend/internal/application/user"
+	domainuser "kubeclaw/backend/internal/domain/user"
 	"kubeclaw/backend/internal/httpapi/middleware"
 
 	"github.com/gin-gonic/gin"
@@ -63,7 +64,31 @@ func (h *UserHandler) GetMe(c *gin.Context) {
 }
 
 func (h *UserHandler) List(c *gin.Context) {
-	profiles, err := h.userService.List(c.Request.Context())
+	currentUser, ok := middleware.CurrentUser(c)
+	if !ok {
+		writeError(c, http.StatusUnauthorized, "UNAUTHORIZED", "current user is missing")
+		return
+	}
+
+	var (
+		profiles []applicationuser.Profile
+		err      error
+	)
+
+	switch currentUser.Role {
+	case domainuser.RoleAdmin:
+		profiles, err = h.userService.List(c.Request.Context())
+	case domainuser.RoleClusterAdmin:
+		if currentUser.TenantID == nil {
+			writeError(c, http.StatusForbidden, "FORBIDDEN", "cluster admin is not bound to a tenant")
+			return
+		}
+		profiles, err = h.userService.ListByTenant(c.Request.Context(), *currentUser.TenantID)
+	default:
+		writeError(c, http.StatusForbidden, "FORBIDDEN", "you do not have permission to access users")
+		return
+	}
+
 	if err != nil {
 		writeError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "load users failed")
 		return

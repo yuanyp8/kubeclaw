@@ -13,22 +13,23 @@ import (
 )
 
 type Dependencies struct {
-	HealthHandler   *handlers.HealthHandler
-	AuthHandler     *handlers.AuthHandler
-	UserHandler     *handlers.UserHandler
-	TenantHandler   *handlers.TenantHandler
-	TeamHandler     *handlers.TeamHandler
-	AuditHandler    *handlers.AuditHandler
-	LogHandler      *handlers.LogHandler
-	ModelHandler    *handlers.ModelHandler
-	ClusterHandler  *handlers.ClusterHandler
-	MCPHandler      *handlers.MCPHandler
-	SkillHandler    *handlers.SkillHandler
-	SecurityHandler *handlers.SecurityHandler
-	AgentHandler    *handlers.AgentHandler
-	StubHandler     *handlers.StubHandler
-	AuthMiddleware  *middleware.AuthMiddleware
-	AuditMiddleware *middleware.AuditMiddleware
+	HealthHandler     *handlers.HealthHandler
+	AuthHandler       *handlers.AuthHandler
+	CapabilityHandler *handlers.CapabilityHandler
+	UserHandler       *handlers.UserHandler
+	TenantHandler     *handlers.TenantHandler
+	TeamHandler       *handlers.TeamHandler
+	AuditHandler      *handlers.AuditHandler
+	LogHandler        *handlers.LogHandler
+	ModelHandler      *handlers.ModelHandler
+	ClusterHandler    *handlers.ClusterHandler
+	MCPHandler        *handlers.MCPHandler
+	SkillHandler      *handlers.SkillHandler
+	SecurityHandler   *handlers.SecurityHandler
+	AgentHandler      *handlers.AgentHandler
+	StubHandler       *handlers.StubHandler
+	AuthMiddleware    *middleware.AuthMiddleware
+	AuditMiddleware   *middleware.AuditMiddleware
 }
 
 // Server 包装 http.Server，负责启动与优雅关闭。

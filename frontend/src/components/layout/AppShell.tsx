@@ -103,7 +103,7 @@ const navGroups: NavGroup[] = [
         to: '/users',
         title: '用户管理',
         description: '维护用户、租户归属与平台角色。',
-        roles: ['admin'],
+        roles: ['admin', 'cluster_admin'],
       },
       {
         to: '/teams',

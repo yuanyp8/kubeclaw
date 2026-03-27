@@ -1,0 +1,5 @@
+./bootstrap.go
+./database.go
+./gorm_logger.go
+./migrate.go
+./models.go

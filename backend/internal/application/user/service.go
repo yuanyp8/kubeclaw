@@ -71,6 +71,7 @@ type UpdateInput struct {
 type Repository interface {
 	domainuser.Repository
 	List(ctx context.Context) ([]Profile, error)
+	ListByTenant(ctx context.Context, tenantID int64) ([]Profile, error)
 	Get(ctx context.Context, id int64) (*Profile, error)
 	Create(ctx context.Context, input CreateInput) (*Profile, error)
 	Update(ctx context.Context, id int64, input UpdateInput) (*Profile, error)
@@ -99,6 +100,10 @@ func (s *Service) GetProfile(ctx context.Context, userID int64) (*Profile, error
 
 func (s *Service) List(ctx context.Context) ([]Profile, error) {
 	return s.userRepo.List(ctx)
+}
+
+func (s *Service) ListByTenant(ctx context.Context, tenantID int64) ([]Profile, error) {
+	return s.userRepo.ListByTenant(ctx, tenantID)
 }
 
 func (s *Service) Get(ctx context.Context, id int64) (*Profile, error) {
